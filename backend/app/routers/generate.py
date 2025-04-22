@@ -15,6 +15,25 @@ from functools import lru_cache
 import re
 import json
 import asyncio
+import logging
+import os
+from app.services.deepseek_chat_service import DeepseekChatService
+
+# 确保日志目录存在
+log_dir = "/app/logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(log_dir, "mermaid_generation.log")),
+        logging.StreamHandler()  # 同时输出到控制台
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # from app.services.claude_service import ClaudeService
 # from app.core.limiter import limiter
@@ -25,7 +44,8 @@ router = APIRouter(prefix="/generate", tags=["OpenAI o4-mini"])
 
 # Initialize services
 # claude_service = ClaudeService()
-o4_service = OpenAIo4Service()
+# o4_service = OpenAIo4Service()
+deepseek_service = DeepseekChatService()
 
 
 # cache github data to avoid double API calls from cost and generate
@@ -65,8 +85,8 @@ async def get_generation_cost(request: Request, body: ApiRequest):
         # file_tree_tokens = claude_service.count_tokens(file_tree)
         # readme_tokens = claude_service.count_tokens(readme)
 
-        file_tree_tokens = o4_service.count_tokens(file_tree)
-        readme_tokens = o4_service.count_tokens(readme)
+        file_tree_tokens = deepseek_service.count_tokens(file_tree)
+        readme_tokens = deepseek_service.count_tokens(readme)
 
         # CLAUDE: Calculate approximate cost
         # Input cost: $3 per 1M tokens ($0.000003 per token)
@@ -148,13 +168,13 @@ async def generate_stream(request: Request, body: ApiRequest):
 
                 # Token count check
                 combined_content = f"{file_tree}\n{readme}"
-                token_count = o4_service.count_tokens(combined_content)
+                token_count = deepseek_service.count_tokens(combined_content)
 
-                if 50000 < token_count < 195000 and not body.api_key:
-                    yield f"data: {json.dumps({'error': f'File tree and README combined exceeds token limit (50,000). Current size: {token_count} tokens. This GitHub repository is too large for my wallet, but you can continue by providing your own OpenAI API key.'})}\n\n"
-                    return
-                elif token_count > 195000:
-                    yield f"data: {json.dumps({'error': f'Repository is too large (>195k tokens) for analysis. OpenAI o4-mini\'s max context length is 200k tokens. Current size: {token_count} tokens.'})}\n\n"
+                # if 50000 < token_count < 195000 and not body.api_key:
+                #     yield f"data: {json.dumps({'error': f'File tree and README combined exceeds token limit (50,000). Current size: {token_count} tokens. This GitHub repository is too large for my wallet, but you can continue by providing your own OpenAI API key.'})}\n\n"
+                #     return
+                if token_count > 65536:
+                    yield f"data: {json.dumps({'error': f'Repository is too large (>65536 tokens) for analysis. Deepseek\'s max context length is 200k tokens. Current size: {token_count} tokens.'})}\n\n"
                     return
 
                 # Prepare prompts
@@ -173,11 +193,11 @@ async def generate_stream(request: Request, body: ApiRequest):
                     )
 
                 # Phase 1: Get explanation
-                yield f"data: {json.dumps({'status': 'explanation_sent', 'message': 'Sending explanation request to o4-mini...'})}\n\n"
+                yield f"data: {json.dumps({'status': 'explanation_sent', 'message': 'Sending explanation request to deepseek...'})}\n\n"
                 await asyncio.sleep(0.1)
                 yield f"data: {json.dumps({'status': 'explanation', 'message': 'Analyzing repository structure...'})}\n\n"
                 explanation = ""
-                async for chunk in o4_service.call_o4_api_stream(
+                async for chunk in deepseek_service.call_chat_api_stream(
                     system_prompt=first_system_prompt,
                     data={
                         "file_tree": file_tree,
@@ -195,11 +215,11 @@ async def generate_stream(request: Request, body: ApiRequest):
                     return
 
                 # Phase 2: Get component mapping
-                yield f"data: {json.dumps({'status': 'mapping_sent', 'message': 'Sending component mapping request to o4-mini...'})}\n\n"
+                yield f"data: {json.dumps({'status': 'mapping_sent', 'message': 'Sending component mapping request to deepseek...'})}\n\n"
                 await asyncio.sleep(0.1)
                 yield f"data: {json.dumps({'status': 'mapping', 'message': 'Creating component mapping...'})}\n\n"
                 full_second_response = ""
-                async for chunk in o4_service.call_o4_api_stream(
+                async for chunk in deepseek_service.call_chat_api_stream(
                     system_prompt=SYSTEM_SECOND_PROMPT,
                     data={"explanation": explanation, "file_tree": file_tree},
                     api_key=body.api_key,
@@ -208,7 +228,6 @@ async def generate_stream(request: Request, body: ApiRequest):
                     full_second_response += chunk
                     yield f"data: {json.dumps({'status': 'mapping_chunk', 'chunk': chunk})}\n\n"
 
-                # i dont think i need this anymore? but keep it here for now
                 # Extract component mapping
                 start_tag = "<component_mapping>"
                 end_tag = "</component_mapping>"
@@ -219,11 +238,11 @@ async def generate_stream(request: Request, body: ApiRequest):
                 ]
 
                 # Phase 3: Generate Mermaid diagram
-                yield f"data: {json.dumps({'status': 'diagram_sent', 'message': 'Sending diagram generation request to o4-mini...'})}\n\n"
+                yield f"data: {json.dumps({'status': 'diagram_sent', 'message': 'Sending diagram generation request to deepseek...'})}\n\n"
                 await asyncio.sleep(0.1)
                 yield f"data: {json.dumps({'status': 'diagram', 'message': 'Generating diagram...'})}\n\n"
                 mermaid_code = ""
-                async for chunk in o4_service.call_o4_api_stream(
+                async for chunk in deepseek_service.call_chat_api_stream(
                     system_prompt=third_system_prompt,
                     data={
                         "explanation": explanation,
@@ -237,14 +256,38 @@ async def generate_stream(request: Request, body: ApiRequest):
                     yield f"data: {json.dumps({'status': 'diagram_chunk', 'chunk': chunk})}\n\n"
 
                 # Process final diagram
-                mermaid_code = mermaid_code.replace("```mermaid", "").replace("```", "")
+                # 使用正则表达式提取 ```mermaid 和 ``` 之间的内容
+                import re
+                mermaid_pattern = r"```mermaid\n(.*?)```"
+                match = re.search(mermaid_pattern, mermaid_code, re.DOTALL)
+                
+                if match:
+                    mermaid_code = match.group(1).strip()
+                else:
+                    # 如果没有找到标准格式，记录原始内容并尝试清理
+                    logger.warning("No standard mermaid code block found, attempting to clean up the response")
+                    logger.warning("Original content:")
+                    logger.warning(mermaid_code)
+                    # 移除所有 ```mermaid 和 ``` 标记作为后备方案
+                    mermaid_code = mermaid_code.replace("```mermaid", "").replace("```", "").strip()
+
                 if "BAD_INSTRUCTIONS" in mermaid_code:
                     yield f"data: {json.dumps({'error': 'Invalid or unclear instructions provided'})}\n\n"
                     return
 
+                # 使用 logger 记录生成的 Mermaid 代码
+                logger.info("\n============ Generated Mermaid Code ============")
+                logger.info(mermaid_code)
+                logger.info("=============================================\n")
+
                 processed_diagram = process_click_events(
                     mermaid_code, body.username, body.repo, default_branch
                 )
+
+                # 使用 logger 记录处理后的 Mermaid 代码
+                logger.info("\n============ Processed Mermaid Code ============")
+                logger.info(processed_diagram)
+                logger.info("=============================================\n")
 
                 # Send final result
                 yield f"data: {json.dumps({
@@ -255,6 +298,7 @@ async def generate_stream(request: Request, body: ApiRequest):
                 })}\n\n"
 
             except Exception as e:
+                logger.error(f"Error in event_generator: {str(e)}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         return StreamingResponse(
@@ -267,4 +311,5 @@ async def generate_stream(request: Request, body: ApiRequest):
             },
         )
     except Exception as e:
+        logger.error(f"Error in generate_stream: {str(e)}")
         return {"error": str(e)}
